@@ -243,10 +243,12 @@ class FSDPEngine(BaseEngine):
         # broadcast_from_rank0 in fsdp2_load_full_state_dict. We bypass from_pretrained
         # entirely for non-rank-0 because init_empty_weights cannot reliably prevent file
         # I/O in custom models (e.g. ApertusForCausalLM) that override _load_pretrained_model.
+        # The weight source is unambiguously global rank 0: fsdp2_load_full_state_dict
+        # keeps real params only on rank 0 (dist.get_rank() == 0), broadcasts them with
+        # broadcast_from_rank0=True, and broadcasts buffers with dist.broadcast(src=0).
+        # So only global rank 0 must load from disk, in every mesh layout (incl. HSDP).
         is_fsdp2 = self.engine_config.strategy == "fsdp2"
-        if is_fsdp2:
-            _coord = self.device_mesh.get_coordinate() if self.device_mesh is not None else None
-            _is_fsdp2_src = (_coord[-1] == 0) if _coord is not None else (torch.distributed.get_rank() == 0)
+        _is_fsdp2_src = torch.distributed.get_rank() == 0
 
         # For fsdp1: keep original behaviour (meta tensors when tie_word_embeddings is False)
         use_meta_tensor = not is_fsdp2 and (not self.model_config.hf_config.tie_word_embeddings)
