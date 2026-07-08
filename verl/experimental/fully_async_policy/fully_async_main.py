@@ -74,14 +74,29 @@ class FullyAsyncTaskRunner:
         self.components["role_worker_mapping"] = role_worker_mapping
         self.components["ray_worker_group_cls"] = ray_worker_group_cls
 
-        print("[ASYNC MAIN] Creating FullyAsyncTrainer first (needed for hybrid worker group injection)...")
-        self._create_trainer(config)
+        if config.async_training.use_trainer_do_validate:
+            # Serial, trainer-first: the rollouter needs the trainer's hybrid worker
+            # group injected before its init_workers(), so the trainer must init first.
+            print("[ASYNC MAIN] Creating FullyAsyncTrainer first (needed for hybrid worker group injection)...")
+            self._create_trainer(config)
 
-        print("[ASYNC MAIN] Injecting trainer's worker group into rollouter for hybrid replicas...")
-        self._setup_hybrid_worker_group(config)
+            print("[ASYNC MAIN] Injecting trainer's worker group into rollouter for hybrid replicas...")
+            self._setup_hybrid_worker_group(config)
 
-        print("[ASYNC MAIN] Creating FullyAsyncRollouter...")
-        self._create_rollouter(config)
+            print("[ASYNC MAIN] Creating FullyAsyncRollouter...")
+            self._create_rollouter(config)
+        else:
+            # No hybrid worker group coupling → trainer and rollouter are independent
+            # (separate resource pools, separate Ray actors). Overlap their init_workers()
+            # so the two disk loads run in parallel instead of trainer-then-rollouter.
+            print("[ASYNC MAIN] use_trainer_do_validate=False: initializing trainer and rollouter in parallel...")
+            trainer = self._build_trainer(config)
+            rollouter = self._build_rollouter(config)
+            ray.get([trainer.init_workers.remote(), rollouter.init_workers.remote()])
+            self.components["trainer"] = trainer
+            self.components["rollouter"] = rollouter
+            ray.get(rollouter.set_max_required_samples.remote())
+            print("[ASYNC MAIN] Parallel trainer + rollouter init complete")
 
         print("[ASYNC MAIN] Setting up rollouter reference on trainer")
         ray.get(self.components["trainer"].set_rollouter.remote(self.components["rollouter"]))
@@ -114,14 +129,18 @@ class FullyAsyncTaskRunner:
 
         print("[ASYNC MAIN] All components initialized successfully")
 
-    def _create_rollouter(self, config) -> None:
-        print("[ASYNC MAIN] Starting create rollouter...")
-        rollouter = FullyAsyncRollouter.remote(
+    def _build_rollouter(self, config):
+        """Construct the rollouter actor handle WITHOUT initializing its workers."""
+        return FullyAsyncRollouter.remote(
             config=config,
             tokenizer=self.components["tokenizer"],
             processor=self.components["processor"],
             device_name=config.trainer.device,
         )
+
+    def _create_rollouter(self, config) -> None:
+        print("[ASYNC MAIN] Starting create rollouter...")
+        rollouter = self._build_rollouter(config)
 
         # set_hybrid_worker_group must be called BEFORE init_workers() so that
         # _init_async_rollout_manager can pass the hybrid WG to ALM.create().
@@ -135,15 +154,14 @@ class FullyAsyncTaskRunner:
         self.components["rollouter"] = rollouter
         print("[ASYNC MAIN] Rollouter created and initialized successfully")
 
-    def _create_trainer(self, config) -> None:
-        print("[ASYNC MAIN] Starting create trainer...")
+    def _build_trainer(self, config):
+        """Construct the trainer actor handle WITHOUT initializing its workers."""
         trainer_role_mapping = {
             role: worker_cls
             for role, worker_cls in self.components["role_worker_mapping"].items()
             if role != Role.Rollout
         }
-
-        trainer = FullyAsyncTrainer.remote(
+        return FullyAsyncTrainer.remote(
             config=config,
             tokenizer=self.components["tokenizer"],
             role_worker_mapping=trainer_role_mapping,
@@ -152,6 +170,9 @@ class FullyAsyncTaskRunner:
             device_name=config.trainer.device,
         )
 
+    def _create_trainer(self, config) -> None:
+        print("[ASYNC MAIN] Starting create trainer...")
+        trainer = self._build_trainer(config)
         ray.get(trainer.init_workers.remote())
         self.components["trainer"] = trainer
         print("[ASYNC MAIN] FullyAsyncTrainer created and initialized successfully")
