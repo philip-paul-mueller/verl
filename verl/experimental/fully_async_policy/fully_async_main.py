@@ -80,15 +80,22 @@ class FullyAsyncTaskRunner:
             print("[ASYNC MAIN] Creating FullyAsyncTrainer first (needed for hybrid worker group injection)...")
             self._create_trainer(config)
 
+            # Extract the trainer's actor_rollout_wg to inject into the rollouter; it backs
+            # the hybrid rollout replicas used during trainer-side validation.
             print("[ASYNC MAIN] Injecting trainer's worker group into rollouter for hybrid replicas...")
-            self._setup_hybrid_worker_group(config)
+            trainer_wg = ray.get(self.components["trainer"].get_actor_wg.remote())
+            self.components["hybrid_worker_group"] = trainer_wg
+            print(
+                f"[ASYNC MAIN] Hybrid worker group extracted from trainer "
+                f"(world_size={getattr(trainer_wg, 'world_size', '?')})"
+            )
 
             print("[ASYNC MAIN] Creating FullyAsyncRollouter...")
             self._create_rollouter(config)
         else:
-            # No hybrid worker group coupling → trainer and rollouter are independent
-            # (separate resource pools, separate Ray actors). Overlap their init_workers()
-            # so the two disk loads run in parallel instead of trainer-then-rollouter.
+            # No hybrid worker group coupling: trainer and rollouter are independent.
+            # Overlap their init_workers() so the two disk loads run in parallel instead
+            # of trainer-then-rollouter.
             print("[ASYNC MAIN] use_trainer_do_validate=False: initializing trainer and rollouter in parallel...")
             trainer = self._build_trainer(config)
             rollouter = self._build_rollouter(config)
@@ -130,7 +137,19 @@ class FullyAsyncTaskRunner:
         print("[ASYNC MAIN] All components initialized successfully")
 
     def _build_rollouter(self, config):
-        """Construct the rollouter actor handle WITHOUT initializing its workers."""
+        """Construct the ``FullyAsyncRollouter`` actor handle, without initializing its workers.
+
+        Single place that instantiates the rollouter actor, shared by both init paths.
+        The parallel path (``use_trainer_do_validate=False``) calls this directly so it
+        can overlap the rollouter's ``init_workers()`` with the trainer's;
+        ``_create_rollouter`` wraps this with hybrid-WG injection + ``init_workers()``
+        for the serial path.
+
+        Constructing the handle deliberately does not inject a hybrid worker group: on
+        the parallel path there is no trainer-side validation and hence no hybrid
+        replicas. The serial path injects the hybrid WG in ``_create_rollouter`` after
+        this call.
+        """
         return FullyAsyncRollouter.remote(
             config=config,
             tokenizer=self.components["tokenizer"],
@@ -139,6 +158,15 @@ class FullyAsyncTaskRunner:
         )
 
     def _create_rollouter(self, config) -> None:
+        """Build the rollouter and fully initialize it (serial path).
+
+        Wraps ``_build_rollouter`` with the steps required when the rollouter is not
+        initialized in parallel with the trainer: inject the trainer's hybrid worker
+        group (if present, for trainer-side validation) before ``init_workers()``, then
+        initialize workers and register the actor in ``self.components``. Used on the
+        ``use_trainer_do_validate=True`` path; the parallel path uses ``_build_rollouter``
+        directly and initializes workers itself.
+        """
         print("[ASYNC MAIN] Starting create rollouter...")
         rollouter = self._build_rollouter(config)
 
@@ -155,7 +183,13 @@ class FullyAsyncTaskRunner:
         print("[ASYNC MAIN] Rollouter created and initialized successfully")
 
     def _build_trainer(self, config):
-        """Construct the trainer actor handle WITHOUT initializing its workers."""
+        """Construct the ``FullyAsyncTrainer`` actor handle, without initializing its workers.
+
+        Single place that instantiates the trainer actor, shared by both init paths.
+        The parallel path (``use_trainer_do_validate=False``) calls this directly so it
+        can overlap the trainer's ``init_workers()`` with the rollouter's;
+        ``_create_trainer`` wraps this with ``init_workers()`` for the serial path.
+        """
         trainer_role_mapping = {
             role: worker_cls
             for role, worker_cls in self.components["role_worker_mapping"].items()
@@ -171,28 +205,17 @@ class FullyAsyncTaskRunner:
         )
 
     def _create_trainer(self, config) -> None:
+        """Build the trainer and fully initialize it (serial path).
+
+        Wraps ``_build_trainer`` with a blocking ``init_workers()`` and registers the
+        actor in ``self.components``. Used on the ``use_trainer_do_validate=True`` path;
+        the parallel path uses ``_build_trainer`` directly and initializes workers itself.
+        """
         print("[ASYNC MAIN] Starting create trainer...")
         trainer = self._build_trainer(config)
         ray.get(trainer.init_workers.remote())
         self.components["trainer"] = trainer
         print("[ASYNC MAIN] FullyAsyncTrainer created and initialized successfully")
-
-    def _setup_hybrid_worker_group(self, config) -> None:
-        """
-        Extract the trainer's actor_rollout_wg and store it for later injection
-        into the rollouter. This WG backs the hybrid rollout replicas
-        used during trainer-side validation (use_trainer_do_validate).
-        """
-        trainer = self.components["trainer"]
-        if config.async_training.use_trainer_do_validate:
-            trainer_wg = ray.get(trainer.get_actor_wg.remote())
-            self.components["hybrid_worker_group"] = trainer_wg
-            print(
-                f"[ASYNC MAIN] Hybrid worker group extracted from trainer "
-                f"(world_size={getattr(trainer_wg, 'world_size', '?')})"
-            )
-        else:
-            print("[ASYNC MAIN] use_trainer_do_validate=False, skipping hybrid worker group setup")
 
     def _run_training_loop(self):
         self.running = True
